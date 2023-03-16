@@ -113,136 +113,92 @@ _action_map = {'stop': ['SHUTOFF'],
 _admin_actions = ['pause', 'unpause', 'suspend', 'resume', 'lock', 'unlock', 'shelve_offload']
 
 
-class ServerActionModule(OpenStackModule):
-    deprecated_names = ('os_server_action', 'openstack.cloud.os_server_action')
+class VolumeActionModule(OpenStackModule):
 
     argument_spec = dict(
-        server=dict(required=True, type='str'),
+        volume=dict(required=True, type='str'),
         action=dict(required=True, type='str',
-                    choices=['stop', 'start', 'pause', 'unpause',
-                             'lock', 'unlock', 'suspend', 'reboot_soft',
-                             'reboot_hard', 'resume',
-                             'rebuild', 'shelve', 'shelve_offload', 'unshelve', 'change_server_password']),
-        image=dict(required=False, type='str'),
-        admin_password=dict(required=False, type='str', no_log=True),
+                    choices=['extend','reset_status', 'revert']),
+        snapshot_id=dict(required=False, type='str'),
+        status=dict(required=False, type='str'),
+        new_size=dict(required=False, type='bool', default=False),
         all_projects=dict(required=False, type='bool', default=False),
     )
     module_kwargs = dict(
-        required_if=[('action', 'rebuild', ['image'])],
+        required_if=[
+            ('action', 'extend', ['new_size']),
+            ('action', 'reset_status', ['status']),
+            ('action', 'revert', ['snapshot_id'])
+        ],
         supports_check_mode=True,
     )
 
     def run(self):
-        os_server = self._preliminary_checks()
-        self._execute_server_action(os_server)
+        volume = self._preliminary_checks()
+        self._execute_volume_action(volume)
         # for some reason we don't wait for lock and unlock before exit
-        if self.params['action'] not in ('lock', 'unlock'):
-            if self.params['wait']:
-                self._wait(os_server)
+        # if self.params['action'] not in ('lock', 'unlock'):
+        #     if self.params['wait']:
+        #         self._wait(os_server)
         self.exit_json(changed=True)
 
     def _preliminary_checks(self):
         # Using Munch object for getting information about a server
-        os_server = self.conn.get_server(
-            self.params['server'],
-            all_projects=self.params['all_projects'],
+        volume = self.conn.get_volume(
+            self.params['volume']
         )
-        if not os_server:
-            self.fail_json(msg='Could not find server %s' % self.params['server'])
+        if not volume:
+            self.fail_json(msg='Could not find volume %s' % self.params['volume'])
         # check mode
-        if self.ansible.check_mode:
-            self.exit_json(changed=self.__system_state_change(os_server))
+        # if self.ansible.check_mode:
+        #     self.exit_json(changed=self.__system_state_change(os_server))
+
         # examine special cases
         # lock, unlock and rebuild don't depend on state, just do it
-        if self.params['action'] not in ('lock', 'unlock', 'rebuild', 'reboot_hard', 'reboot_hard', 'change_server_password'):
-            if not self.__system_state_change(os_server):
-                self.exit_json(changed=False)
-        return os_server
+        # if self.params['action'] not in ('lock', 'unlock', 'rebuild', 'reboot_hard', 'reboot_hard', 'change_server_password'):
+        #     if not self.__system_state_change(os_server):
+        #         self.exit_json(changed=False)
+        return volume
 
-    def _execute_server_action(self, os_server):
-        if self.params['action'] == 'rebuild':
-            return self._rebuild_server(os_server)
-        if self.params['action'] == 'shelve_offload':
-            # shelve_offload is not supported in OpenstackSDK
-            return self._action(os_server, json={'shelveOffload': None})
-        if self.params['action'] == 'change_server_password':
-            return self.conn.compute.change_server_password(os_server, self.params['admin_password'])
-        action_name = self.params['action'] + "_server"
+    def _execute_volume_action(self, volume):
 
-        # reboot_* actions are using reboot_server method with an
-        # additional argument
-        if self.params['action'] in ['reboot_soft', 'reboot_hard']:
-            action_name = 'reboot_server'
+        if self.params['action'] == 'extend':
+            return self.conn.block_storage.extend_volume(volume, self.params['new_size'])
+        if self.params['action'] == 'reset_status':
+            return self.conn.block_storage.reset_volume_status(volume, self.params['status'])
+        if self.params['action'] == 'revert':
+            return self.conn.block_storage.revert_volume_to_snapshot(volume, self.params['snapshot_id'])
 
-        try:
-            func_name = getattr(self.conn.compute, action_name)
-        except AttributeError:
-            self.fail_json(
-                msg="Method %s wasn't found in OpenstackSDK compute" % action_name)
+        # if self.params['action'] == 'rebuild':
+        #     return self._rebuild_server(os_server)
+        # if self.params['action'] == 'shelve_offload':
+        #     # shelve_offload is not supported in OpenstackSDK
+        #     return self._action(os_server, json={'shelveOffload': None})
+        # if self.params['action'] == 'change_server_password':
+        #     return self.conn.compute.change_server_password(os_server, self.params['admin_password'])
+        # action_name = self.params['action'] + "_server"
 
-        # Do the action
-        if self.params['action'] == 'reboot_soft':
-            func_name(os_server, 'SOFT')
-        elif self.params['action'] == 'reboot_hard':
-            func_name(os_server, 'HARD')
-        else:
-            func_name(os_server)
-    
-    def _rebuild_server(self, os_server):
-        # rebuild should ensure images exists
-        try:
-            image = self.conn.get_image(self.params['image'])
-        except Exception as e:
-            self.fail_json(
-                msg="Can't find the image %s: %s" % (self.params['image'], e))
-        if not image:
-            self.fail_json(msg="Image %s was not found!" % self.params['image'])
-        # admin_password is required by SDK, but not required by Nova API
-        if self.params['admin_password']:
-            self.conn.compute.rebuild_server(
-                server=os_server,
-                name=os_server['name'],
-                image=image['id'],
-                admin_password=self.params['admin_password']
-            )
-        else:
-            self._action(os_server, json={'rebuild': {'imageRef': image['id']}})
+        # # reboot_* actions are using reboot_server method with an
+        # # additional argument
+        # if self.params['action'] in ['reboot_soft', 'reboot_hard']:
+        #     action_name = 'reboot_server'
 
-    def _action(self, os_server, json):
-        response = self.conn.compute.post(
-            '/servers/{server_id}/action'.format(server_id=os_server['id']),
-            json=json)
-        self.sdk.exceptions.raise_from_response(response)
-        return response
+        # try:
+        #     func_name = getattr(self.conn.compute, action_name)
+        # except AttributeError:
+        #     self.fail_json(
+        #         msg="Method %s wasn't found in OpenstackSDK compute" % action_name)
 
-    def _wait(self, os_server):
-        """Wait for the server to reach the desired state for the given action."""
-        # The wait_for_server function needs a Server object instead of the
-        # Munch object returned by self.conn.get_server
-        server = self.conn.compute.get_server(os_server['id'])
-        states = _action_map[self.params['action']]
-
-        try:
-            self.conn.compute.wait_for_server(
-                server,
-                status=states[0],
-                wait=self.params['timeout'])
-        except self.sdk.exceptions.ResourceTimeout:
-            # raise if there is only one valid state
-            if len(states) < 2:
-                raise
-            # fetch current server status and compare to other valid states
-            server = self.conn.compute.get_server(os_server['id'])
-            if server.status not in states:
-                raise
-
-    def __system_state_change(self, os_server):
-        """Check if system state would change."""
-        return os_server.status not in _action_map[self.params['action']]
-
+        # # Do the action
+        # if self.params['action'] == 'reboot_soft':
+        #     func_name(os_server, 'SOFT')
+        # elif self.params['action'] == 'reboot_hard':
+        #     func_name(os_server, 'HARD')
+        # else:
+        #     func_name(os_server)
 
 def main():
-    module = ServerActionModule()
+    module = VolumeActionModule()
     module()
 
 
